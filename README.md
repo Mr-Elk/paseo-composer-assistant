@@ -1,2 +1,31 @@
-# paseo-composer-assistant
-Paseo input assistant: preview, optional completion and safe draft handling (planned).
+# Paseo Composer Assistant
+
+> 状态：规划中。当前仓库还不是可安装插件，也不会调用模型。
+
+为 [Paseo](https://github.com/getpaseo/paseo) 的当前会话提供输入建议：用户先查看建议，再决定是否写回草稿；发送始终由用户自己决定。
+
+## 计划功能
+
+- 手动优化整段文字或选中部分，在紧凑浮窗中比较、采纳或保留原文。
+- 可选的输入续写和回复后建议；默认关闭自动建议。
+- 在输入区附近提供快捷设置，并说明辅助模型、内容发送范围和可能费用。
+- 草稿或会话发生变化时丢弃旧建议；保护附件、引用、中文输入法和宿主命令。
+
+## 已有项目与复用
+
+- [DSH Composer Assistant](https://github.com/Mr-Elk/dsh-composer-assistant)：计划复用或提取其与宿主无关的文本保护、上下文和请求调度逻辑，保留原版权和许可证。DSH 专用界面、模型调用与存储不能直接当成 Paseo 接入。
+- [PromptKit](https://github.com/hungcuong9125/paseo-prompt-kit)：已有 Paseo 草稿改写，可作为功能和兼容性对照；其直接替换草稿的交互与本项目计划的预览后采纳不同。
+
+## 工作拆解
+
+- [ ] 确认原生草稿、选区、光标和版本的安全读写方式。
+- [ ] 接入通用文本保护、生成准备和过期结果检查。
+- [ ] 接入用户明确选择的辅助模型；不读取其他客户端的登录信息。
+- [ ] 做手动优化的预览和采纳，再分别加入续写、预测及快捷设置。
+- [ ] 在真实支持的 Paseo 版本和客户端检查输入法、附件、命令、取消和恢复。
+
+Paseo 0.15.0 的公开插件接口目前未发现原生草稿和选区读写接口。基于网页内部结构的方案需要单独说明兼容范围；在宿主的 `/` 命令菜单按 Tab 可能执行归档命令的问题解决前，不默认用 Tab 采纳建议。
+
+## License
+
+本仓库采用 [MIT License](LICENSE)。实际引入第三方代码时，将一并保留对应版权和许可证声明。

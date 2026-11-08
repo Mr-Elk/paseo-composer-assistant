@@ -1,0 +1,1316 @@
+diff --git a/packages/app/src/components/ui/text-input/text-input.web.tsx b/packages/app/src/components/ui/text-input/text-input.web.tsx
+index 021e3b8..a3e205f 100644
+--- a/packages/app/src/components/ui/text-input/text-input.web.tsx
++++ b/packages/app/src/components/ui/text-input/text-input.web.tsx
+@@ -16,6 +16,7 @@ export const EditingTextInput = forwardRef<EditingTextInputHandle, EditingTextIn
+       onChangeText,
+       onPasteImages: _,
+       onPasteError: __,
++      onCompositionStateChange: onCompositionStateChangeProp,
+       variant: ___,
+       value: ____,
+       defaultValue: _____,
+@@ -27,16 +28,22 @@ export const EditingTextInput = forwardRef<EditingTextInputHandle, EditingTextIn
+     const isComposingRef = useRef(false);
+     const onChangeTextRef = useRef(onChangeText);
+     onChangeTextRef.current = onChangeText;
++    const onCompositionStateChangeRef = useRef(onCompositionStateChangeProp);
++    onCompositionStateChangeRef.current = onCompositionStateChangeProp;
+ 
+     useEffect(() => {
+       const input = inputRef.current as WebTextInputElement | null;
+       if (!input) return;
+ 
+       const startComposition = () => {
++        if (isComposingRef.current) return;
+         isComposingRef.current = true;
++        onCompositionStateChangeRef.current?.();
+       };
+       const endComposition = () => {
++        const wasComposing = isComposingRef.current;
+         isComposingRef.current = false;
++        if (wasComposing) onCompositionStateChangeRef.current?.();
+         const nextText = input.value ?? "";
+         if (nextText === textRef.current) return;
+         textRef.current = nextText;
+@@ -87,6 +94,7 @@ export const EditingTextInput = forwardRef<EditingTextInputHandle, EditingTextIn
+           if (input && "value" in input) input.value = "";
+         },
+         getNativeRef: () => inputRef.current,
++        getCompositionState: () => (isComposingRef.current ? "composing" : "idle"),
+       }),
+       [],
+     );
+diff --git a/packages/app/src/components/ui/text-input/types.ts b/packages/app/src/components/ui/text-input/types.ts
+index fbc14e4..ae49dba 100644
+--- a/packages/app/src/components/ui/text-input/types.ts
++++ b/packages/app/src/components/ui/text-input/types.ts
+@@ -12,6 +12,11 @@ export interface EditingTextInputHandle {
+   /** Clear the editor and reset its intrinsic layout, preserving focus intent. */
+   reset(): void;
+   getNativeRef(): unknown;
++  /**
++   * Web reports whether an IME composition is in progress. Native editors cannot tell, so they
++   * omit this and callers must treat the state as unknown (writes are refused).
++   */
++  getCompositionState?(): "idle" | "composing";
+ }
+ 
+ export interface EditingTextInputProps extends Omit<
+@@ -22,5 +27,7 @@ export interface EditingTextInputProps extends Omit<
+   onChangeText?: (text: string) => void;
+   onPasteImages?: (files: readonly NativePastedFile[]) => void;
+   onPasteError?: (message: string) => void;
++  /** Web only: runs when an IME composition starts or ends. */
++  onCompositionStateChange?: () => void;
+   variant?: "default" | "bottom-sheet";
+ }
+diff --git a/packages/app/src/composer/index.tsx b/packages/app/src/composer/index.tsx
+index d6b4bae..fdc6a69 100644
+--- a/packages/app/src/composer/index.tsx
++++ b/packages/app/src/composer/index.tsx
+@@ -5,6 +5,14 @@ import {
+ } from "./editing-session";
+ import type { ComposerTextSource } from "./text-source";
+ import { createStore, type StoreApi } from "zustand/vanilla";
++import type { PluginComposerSnapshot } from "@getpaseo/plugin/client";
++import {
++  checkComposerEdit,
++  composerBridgeStore,
++  createComposerDraftId,
++  selectionChanged,
++  type ComposerDraftHandle,
++} from "@/plugins/composer-bridge/store";
+ import { useStore } from "zustand";
+ import { getHostRuntimeStore } from "@/runtime/host-runtime";
+ import { LoadingSpinner } from "@/components/ui/loading-spinner";
+@@ -1319,7 +1327,34 @@ function ComposerContentImpl({
+     () => textSource.getSnapshot().trim().length > 0,
+     () => textSource.getSnapshot().trim().length > 0,
+   );
+-  const setUserInput = onChangeText;
++  const composerRevisionRef = useRef(0);
++  const composerDraftIdRef = useRef("");
++  const composerLastTextRef = useRef<string | null>(null);
++  const composerLastSelectionRef = useRef<{ start: number; end: number } | null>(null);
++  const composerEditableRef = useRef(true);
++  composerEditableRef.current = !readOnly && !isSubmitLoading;
++  const composerAttachmentCountRef = useRef(0);
++  composerAttachmentCountRef.current = attachments.length;
++  const handleComposerTextChange = useCallback(
++    (text: string) => {
++      composerRevisionRef.current += 1;
++      composerLastTextRef.current = text;
++      onChangeText(text);
++      composerBridgeStore.notify(serverId, workspaceId ?? "", agentId);
++    },
++    [agentId, onChangeText, serverId, workspaceId],
++  );
++  const notifyComposerBridge = useCallback(() => {
++    composerRevisionRef.current += 1;
++    composerBridgeStore.notify(serverId, workspaceId ?? "", agentId);
++  }, [agentId, serverId, workspaceId]);
++  const observeComposerSelection = useCallback((selection: { start: number; end: number }) => {
++    if (selectionChanged(composerLastSelectionRef.current, selection)) {
++      composerRevisionRef.current += 1;
++    }
++    composerLastSelectionRef.current = { ...selection };
++  }, []);
++  const setUserInput = handleComposerTextChange;
+   const workspaceAttachments = useWorkspaceAttachmentsForScopes(attachmentScopeKeys);
+   const {
+     selectedAttachments,
+@@ -1414,9 +1449,9 @@ function ComposerContentImpl({
+         messageInputRef.current.replaceText(text, selection);
+         return;
+       }
+-      onChangeText(text);
++      handleComposerTextChange(text);
+     },
+-    [onChangeText],
++    [handleComposerTextChange],
+   );
+ 
+   const runClientSlashCommand = useCallback(
+@@ -2242,14 +2277,73 @@ function ComposerContentImpl({
+ 
+   const handleSelectionChange = useCallback(
+     (selection: { start: number; end: number }) => {
++      observeComposerSelection(selection);
+       if (isWeb) {
+         cursorPublication.stage(selection.start);
+       } else {
+         cursor.setState(selection.start);
+       }
++      composerBridgeStore.notify(serverId, workspaceId ?? "", agentId);
+     },
+-    [cursorPublication, cursor],
+-  );
++    [agentId, cursorPublication, cursor, observeComposerSelection, serverId, workspaceId],
++  );
++
++  // Plugin draft bridge. The handle reads live refs only, so a registration can never serve text
++  // from an editor that has unmounted or switched agents. Writes re-check the revision and the
++  // exact text under the range, and refuse while an IME composition is active.
++  useLayoutEffect(() => {
++    const targetWorkspaceId = workspaceId ?? "";
++    composerDraftIdRef.current = createComposerDraftId(serverId, targetWorkspaceId, agentId);
++    composerRevisionRef.current = 0;
++    composerLastTextRef.current = null;
++    composerLastSelectionRef.current = null;
++    const readSnapshot = (): Omit<PluginComposerSnapshot, "workspaceId" | "agentId"> => {
++      const input = messageInputRef.current;
++      const snapshot = input?.getInputSnapshot();
++      const text = snapshot?.text ?? textSource.getSnapshot();
++      if (composerLastTextRef.current !== null && composerLastTextRef.current !== text) {
++        composerRevisionRef.current += 1;
++      }
++      composerLastTextRef.current = text;
++      const selection = snapshot?.selection ?? { start: text.length, end: text.length };
++      observeComposerSelection(selection);
++      return {
++        draftId: composerDraftIdRef.current,
++        revision: composerRevisionRef.current,
++        text,
++        selection,
++        ime: input?.getCompositionState?.() ?? "unknown",
++        attachments: composerAttachmentCountRef.current,
++        editable: composerEditableRef.current && Boolean(input),
++      };
++    };
++    const handle: ComposerDraftHandle = {
++      read: readSnapshot,
++      apply(edit) {
++        const input = messageInputRef.current;
++        if (!input) return { ok: false, reason: "unavailable" };
++        const snapshot = readSnapshot();
++        const failure = checkComposerEdit(snapshot, edit);
++        if (failure) return { ok: false, reason: failure };
++        const { start, end } = edit.range;
++        const nextText =
++          snapshot.text.slice(0, start) + edit.replacement + snapshot.text.slice(end);
++        const caret = start + edit.replacement.length;
++        const undoable =
++          input.replaceRangePreservingUndo(edit.range, edit.replacement) &&
++          input.getText() === nextText;
++        if (!undoable) {
++          input.replaceText(nextText, { start: caret, end: caret });
++        }
++        return { ok: true, revision: composerRevisionRef.current, undoable };
++      },
++    };
++    return composerBridgeStore.register(serverId, targetWorkspaceId, agentId, handle);
++  }, [agentId, messageInputRef, observeComposerSelection, serverId, textSource, workspaceId]);
++
++  useEffect(() => {
++    composerBridgeStore.notify(serverId, workspaceId ?? "", agentId);
++  }, [agentId, attachments.length, isSubmitLoading, readOnly, serverId, workspaceId]);
+ 
+   const handleFocusChange = useCallback(
+     (focused: boolean) => {
+@@ -2466,6 +2560,7 @@ function ComposerContentImpl({
+                   submissionError={sendErrorNode}
+                   value={textSource.getSnapshot()}
+                   onChangeText={setUserInput}
++                  onCompositionStateChange={notifyComposerBridge}
+                   onSubmit={handleSubmit}
+                   hasExternalContent={hasExternalContent}
+                   allowEmptySubmit={allowEmptySubmit}
+diff --git a/packages/app/src/composer/input/input.tsx b/packages/app/src/composer/input/input.tsx
+index 8cb8cd4..ffb805d 100644
+--- a/packages/app/src/composer/input/input.tsx
++++ b/packages/app/src/composer/input/input.tsx
+@@ -195,6 +195,8 @@ export interface MessageInputProps {
+   readOnly?: boolean;
+   /** Command issued when application state must replace native-owned text. */
+   textReplacement: TextReplacement;
++  /** Reports IME composition transitions to hosts that expose the draft to plugins. */
++  onCompositionStateChange?: () => void;
+   /** Replaces the submit icon with this label, still inside the composer's own toolbar row. */
+   submitLabel?: string;
+ }
+@@ -204,7 +206,17 @@ export interface MessageInputRef {
+   blur: () => void;
+   getText: () => string;
+   getInputSnapshot: () => ComposerInputSnapshot;
++  /** Reports whether an IME composition is active; `unknown` refuses draft writes. */
++  getCompositionState: () => "idle" | "composing" | "unknown";
+   replaceText: (text: string, selection?: { start: number; end: number }) => void;
++  /**
++   * Web: replaces one range through the browser's own editing command so the native undo stack
++   * keeps working. Returns false when the platform cannot do it and the caller should fall back.
++   */
++  replaceRangePreservingUndo: (
++    range: { start: number; end: number },
++    replacement: string,
++  ) => boolean;
+   runKeyboardAction: (action: MessageInputKeyboardActionKind) => boolean;
+   /**
+    * Web-only: return the underlying DOM element for focus assertions/retries.
+@@ -659,6 +671,7 @@ interface ComposerTextSurfaceProps {
+   onSelectionChange: (event: NativeSyntheticEvent<TextInputSelectionChangeEventData>) => void;
+   onPasteImages: ((files: readonly NativePastedFile[]) => void) | undefined;
+   onPasteError: (message: string) => void;
++  onCompositionStateChange?: () => void;
+   fullscreen: boolean;
+   compact: boolean;
+   onRenderedLinesChange: (lines: number) => void;
+@@ -728,6 +741,7 @@ function ComposerTextSurface(props: ComposerTextSurfaceProps): React.ReactElemen
+         onSelectionChange={props.onSelectionChange}
+         onPasteImages={props.onPasteImages}
+         onPasteError={props.onPasteError}
++        onCompositionStateChange={props.onCompositionStateChange}
+         autoFocus={props.autoFocus}
+       />
+       <FocusHint
+@@ -1417,6 +1431,33 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
+       [editingSession, replaceText],
+     );
+ 
++    const replaceRangePreservingUndo = useCallback(
++      (range: { start: number; end: number }, replacement: string) => {
++        if (
++          !isWeb ||
++          typeof document === "undefined" ||
++          typeof document.execCommand !== "function"
++        ) {
++          return false;
++        }
++        const element = getWebTextAreaImpl(textInputRef.current) as
++          | (TextAreaHandle & {
++              focus?: () => void;
++              setSelectionRange?: (start: number, end: number) => void;
++            })
++          | null;
++        if (!element?.setSelectionRange) return false;
++        element.focus?.();
++        element.setSelectionRange(range.start, range.end);
++        try {
++          return document.execCommand("insertText", false, replacement);
++        } catch {
++          return false;
++        }
++      },
++      [],
++    );
++
+     useImperativeHandle(ref, () => ({
+       focus: () => {
+         textInputRef.current?.focus();
+@@ -1427,7 +1468,9 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
+       getText: () => textInputRef.current?.getText() ?? valueRef.current,
+       getInputSnapshot: () =>
+         getComposerInputSnapshot(textInputRef.current, valueRef.current, selectionRef.current),
++      getCompositionState: () => textInputRef.current?.getCompositionState?.() ?? "unknown",
+       replaceText,
++      replaceRangePreservingUndo,
+       runKeyboardAction: (action) =>
+         runMessageInputKeyboardAction(action, {
+           focusInput: () => textInputRef.current?.focus(),
+@@ -2074,6 +2117,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
+             onSelectionChange={handleSelectionChange}
+             onPasteImages={onPasteImages}
+             onPasteError={handlePasteError}
++            onCompositionStateChange={props.onCompositionStateChange}
+             fullscreen={isFullscreen}
+             compact={isCompact}
+             onRenderedLinesChange={setRenderedLines}
+@@ -2106,6 +2150,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
+         handleSelectionChange,
+         onPasteImages,
+         handlePasteError,
++        props.onCompositionStateChange,
+         isFullscreen,
+         isCompact,
+         isInputFocused,
+diff --git a/packages/app/src/panels/agent-panel.tsx b/packages/app/src/panels/agent-panel.tsx
+index 147ab7b..88303b8 100644
+--- a/packages/app/src/panels/agent-panel.tsx
++++ b/packages/app/src/panels/agent-panel.tsx
+@@ -67,6 +67,7 @@ import { PaneSubtitle } from "@/panels/pane-subtitle";
+ import { definePanel } from "@/panels/panel-registry";
+ import { RenderProfile } from "@/utils/render-profiler";
+ import { useHasPluginComposerPills } from "@/plugins";
++import { PluginComposerStatusRow } from "@/plugins";
+ import { buildDraftPanelDescriptor } from "@/panels/draft-panel-descriptor";
+ import {
+   type HostRuntimeConnectionStatus,
+@@ -1172,23 +1173,26 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
+     <ParentAgentCallout serverId={serverId} parentAgentId={parentAgentId} />
+   ) : null;
+   const composerSection = showsComposer ? (
+-    <RenderProfile id={`AgentComposerSection:${agentId}`}>
+-      <AgentComposerSection
+-        agentId={agentId}
+-        serverId={serverId}
+-        isPaneFocused={isPaneFocused}
+-        isArchivingCurrentAgent={isArchivingCurrentAgent}
+-        archivedAt={agentState.archivedAt}
+-        cwd={cwd}
+-        isSubmitLoading={false}
+-        agentInputDraft={agentInputDraft}
+-        editingSession={composerEditingSession}
+-        onAttentionInputFocus={onAttentionInputFocus}
+-        onAttentionPromptSend={onAttentionPromptSend}
+-        onComposerHeightChange={handleComposerHeightChange}
+-        onMessageSent={handleMessageSent}
+-      />
+-    </RenderProfile>
++    <>
++      <RenderProfile id={`AgentComposerSection:${agentId}`}>
++        <AgentComposerSection
++          agentId={agentId}
++          serverId={serverId}
++          isPaneFocused={isPaneFocused}
++          isArchivingCurrentAgent={isArchivingCurrentAgent}
++          archivedAt={agentState.archivedAt}
++          cwd={cwd}
++          isSubmitLoading={false}
++          agentInputDraft={agentInputDraft}
++          editingSession={composerEditingSession}
++          onAttentionInputFocus={onAttentionInputFocus}
++          onAttentionPromptSend={onAttentionPromptSend}
++          onComposerHeightChange={handleComposerHeightChange}
++          onMessageSent={handleMessageSent}
++        />
++      </RenderProfile>
++      <PluginComposerStatusRow serverId={serverId} workspaceId={workspaceId} agentId={agentId} />
++    </>
+   ) : (
+     parentCallout
+   );
+diff --git a/packages/app/src/plugins/client-runtime.ts b/packages/app/src/plugins/client-runtime.ts
+index 61e921b..467f32c 100644
+--- a/packages/app/src/plugins/client-runtime.ts
++++ b/packages/app/src/plugins/client-runtime.ts
+@@ -11,6 +11,8 @@ import { createPluginClientStateSource } from "./client-state/source";
+ import type { PluginClientRuntime } from "./evaluate";
+ import { createPluginNavigation } from "./navigation";
+ import { pluginButtonStore } from "./buttons";
++import { composerBridgeStore } from "./composer-bridge/store";
++import { composerStatusStore } from "./composer-status/store";
+ import type { InstalledPlugin } from "./types";
+ 
+ export function createPluginClientRuntime(
+@@ -33,6 +35,16 @@ export function createPluginClientRuntime(
+     addHeaderButton(contribution) {
+       return pluginButtonStore.addHeaderButton(installation, contribution);
+     },
++    addComposerStatus(contribution) {
++      return composerStatusStore.add(installation, contribution);
++    },
++    composer: {
++      version: 1,
++      read: (target) => composerBridgeStore.read(installation.serverId, target),
++      subscribe: (target, listener) =>
++        composerBridgeStore.subscribe(installation.serverId, target, listener),
++      apply: (target, edit) => composerBridgeStore.apply(installation.serverId, target, edit),
++    },
+     openPanel(panelId, options) {
+       openClientPanel({ installation, state, panelId, options });
+     },
+diff --git a/packages/app/src/plugins/composer-bridge/store.test.ts b/packages/app/src/plugins/composer-bridge/store.test.ts
+new file mode 100644
+index 0000000..54f9c3a
+--- /dev/null
++++ b/packages/app/src/plugins/composer-bridge/store.test.ts
+@@ -0,0 +1,179 @@
++import { describe, expect, it, vi } from "vitest";
++import type { PluginComposerEdit, PluginComposerSnapshot } from "@getpaseo/plugin/client";
++import {
++  checkComposerEdit,
++  ComposerBridgeStore,
++  createComposerDraftId,
++  selectionChanged,
++  type ComposerDraftHandle,
++} from "./store";
++
++type Draft = Omit<PluginComposerSnapshot, "workspaceId" | "agentId">;
++
++function draft(overrides: Partial<Draft> = {}): Draft {
++  return {
++    draftId: "composer:host-a:wks-1:agent-1",
++    revision: 3,
++    text: "please improve this sentence",
++    selection: { start: 7, end: 28 },
++    ime: "idle",
++    attachments: 0,
++    editable: true,
++    ...overrides,
++  };
++}
++
++function edit(overrides: Partial<PluginComposerEdit> = {}): PluginComposerEdit {
++  return {
++    draftId: "composer:host-a:wks-1:agent-1",
++    revision: 3,
++    range: { start: 7, end: 28 },
++    expectedText: "improve this sentence",
++    replacement: "make this sentence clearer",
++    ...overrides,
++  };
++}
++
++function handle(state: Draft = draft()) {
++  const reads: Draft[] = [];
++  const writes: PluginComposerEdit[] = [];
++  const value: ComposerDraftHandle = {
++    read: () => {
++      reads.push(state);
++      return state;
++    },
++    apply: (input) => {
++      writes.push(input);
++      return { ok: true, revision: state.revision + 1, undoable: false };
++    },
++  };
++  return { value, reads, writes };
++}
++
++describe("checkComposerEdit", () => {
++  it("gives a remounted editor a different draft id", () => {
++    const before = createComposerDraftId("host-a", "wks-1", "agent-1");
++    const after = createComposerDraftId("host-a", "wks-1", "agent-1");
++    expect(after).not.toBe(before);
++    expect(checkComposerEdit(draft({ draftId: after }), edit({ draftId: before }))).toBe("stale");
++  });
++
++  it("recognizes selection movement without treating identical events as a change", () => {
++    const selected = { start: 2, end: 8 };
++    expect(selectionChanged(null, selected)).toBe(false);
++    expect(selectionChanged(selected, { ...selected })).toBe(false);
++    expect(selectionChanged(selected, { start: 3, end: 8 })).toBe(true);
++    expect(selectionChanged(selected, { start: 2, end: 9 })).toBe(true);
++  });
++  it("accepts a matching revision and range", () => {
++    expect(checkComposerEdit(draft(), edit())).toBeNull();
++  });
++
++  it("refuses when the draft moved past the revision the plugin read", () => {
++    expect(checkComposerEdit(draft({ revision: 4 }), edit())).toBe("stale");
++  });
++
++  it("refuses when the pane switched to another draft", () => {
++    expect(checkComposerEdit(draft({ draftId: "other" }), edit())).toBe("stale");
++  });
++
++  it("refuses when the text under the range changed", () => {
++    expect(checkComposerEdit(draft({ text: "please review this sentence" }), edit())).toBe(
++      "mismatch",
++    );
++  });
++
++  it("refuses out-of-range edits", () => {
++    expect(checkComposerEdit(draft(), edit({ range: { start: 0, end: 999 } }))).toBe("mismatch");
++    expect(checkComposerEdit(draft(), edit({ range: { start: 5, end: 2 } }))).toBe("mismatch");
++    expect(checkComposerEdit(draft(), edit({ range: { start: 1.5, end: 2 } }))).toBe("mismatch");
++  });
++
++  it("refuses during IME composition and when IME state is unknown", () => {
++    expect(checkComposerEdit(draft({ ime: "composing" }), edit())).toBe("ime");
++    expect(checkComposerEdit(draft({ ime: "unknown" }), edit())).toBe("ime");
++  });
++
++  it("refuses while the composer is not editable", () => {
++    expect(checkComposerEdit(draft({ editable: false }), edit())).toBe("read-only");
++  });
++});
++
++describe("ComposerBridgeStore", () => {
++  it("reads through the most recently mounted editor for a target", () => {
++    const store = new ComposerBridgeStore();
++    const first = handle(draft({ text: "first" }));
++    const second = handle(draft({ text: "second" }));
++    const releaseFirst = store.register("host-a", "wks-1", "agent-1", first.value);
++    const releaseSecond = store.register("host-a", "wks-1", "agent-1", second.value);
++    expect(store.read("host-a", { workspaceId: "wks-1", agentId: "agent-1" })?.text).toBe("second");
++    releaseSecond();
++    expect(store.read("host-a", { workspaceId: "wks-1", agentId: "agent-1" })?.text).toBe("first");
++    releaseFirst();
++    expect(store.read("host-a", { workspaceId: "wks-1", agentId: "agent-1" })).toBeNull();
++  });
++
++  it("keeps hosts and agents apart", () => {
++    const store = new ComposerBridgeStore();
++    const hostA = handle(draft({ text: "host a" }));
++    const hostB = handle(draft({ text: "host b" }));
++    store.register("host-a", "wks-1", "agent-1", hostA.value);
++    store.register("host-b", "wks-1", "agent-1", hostB.value);
++    expect(store.read("host-a", { workspaceId: "wks-1", agentId: "agent-1" })?.text).toBe("host a");
++    expect(store.read("host-b", { workspaceId: "wks-1", agentId: "agent-1" })?.text).toBe("host b");
++    expect(store.read("host-a", { workspaceId: "wks-1", agentId: "agent-2" })).toBeNull();
++  });
++
++  it("returns unavailable instead of writing when no editor is mounted", () => {
++    const store = new ComposerBridgeStore();
++    expect(store.apply("host-a", { workspaceId: "wks-1", agentId: "agent-1" }, edit())).toEqual({
++      ok: false,
++      reason: "unavailable",
++    });
++  });
++
++  it("routes writes to the mounted editor", () => {
++    const store = new ComposerBridgeStore();
++    const mounted = handle();
++    store.register("host-a", "wks-1", "agent-1", mounted.value);
++    const result = store.apply("host-a", { workspaceId: "wks-1", agentId: "agent-1" }, edit());
++    expect(result).toEqual({ ok: true, revision: 4, undoable: false });
++    expect(mounted.writes).toHaveLength(1);
++  });
++
++  it("notifies subscribers with the current snapshot, including removal", () => {
++    const store = new ComposerBridgeStore();
++    const target = { workspaceId: "wks-1", agentId: "agent-1" };
++    const seen: (string | null)[] = [];
++    const release = store.subscribe("host-a", target, (snapshot) => {
++      seen.push(snapshot ? snapshot.text : null);
++    });
++    expect(seen).toEqual([null]);
++    const mounted = handle(draft({ text: "hello" }));
++    const unregister = store.register("host-a", "wks-1", "agent-1", mounted.value);
++    store.notify("host-a", "wks-1", "agent-1");
++    unregister();
++    expect(seen).toEqual([null, "hello", "hello", null]);
++    release();
++    store.notify("host-a", "wks-1", "agent-1");
++    expect(seen).toHaveLength(4);
++  });
++
++  it("calls listeners once per notify, not per subscriber mutation", () => {
++    const store = new ComposerBridgeStore();
++    const mounted = handle();
++    store.register("host-a", "wks-1", "agent-1", mounted.value);
++    const listener = vi.fn();
++    const release = store.subscribe(
++      "host-a",
++      { workspaceId: "wks-1", agentId: "agent-1" },
++      listener,
++    );
++    expect(listener).toHaveBeenCalledTimes(1);
++    store.notify("host-a", "wks-1", "agent-1");
++    expect(listener).toHaveBeenCalledTimes(2);
++    release();
++    store.notify("host-a", "wks-1", "agent-1");
++    expect(listener).toHaveBeenCalledTimes(2);
++  });
++});
+diff --git a/packages/app/src/plugins/composer-bridge/store.ts b/packages/app/src/plugins/composer-bridge/store.ts
+new file mode 100644
+index 0000000..cc03424
+--- /dev/null
++++ b/packages/app/src/plugins/composer-bridge/store.ts
+@@ -0,0 +1,136 @@
++import type {
++  PluginComposerEdit,
++  PluginComposerEditFailure,
++  PluginComposerEditResult,
++  PluginComposerSnapshot,
++  PluginComposerTarget,
++} from "@getpaseo/plugin/client";
++
++const SEPARATOR = "\u0000";
++
++let nextDraftInstance = 0;
++
++/** A new mount must never accept a suggestion created for an earlier editor instance. */
++export function createComposerDraftId(
++  serverId: string,
++  workspaceId: string,
++  agentId: string,
++): string {
++  nextDraftInstance += 1;
++  return JSON.stringify([serverId, workspaceId, agentId, nextDraftInstance]);
++}
++
++export function selectionChanged(
++  previous: { start: number; end: number } | null,
++  current: { start: number; end: number },
++): boolean {
++  return previous !== null && (previous.start !== current.start || previous.end !== current.end);
++}
++
++function targetKey(serverId: string, workspaceId: string, agentId: string): string {
++  return [serverId, workspaceId, agentId].join(SEPARATOR);
++}
++
++type DraftSnapshot = Omit<PluginComposerSnapshot, "workspaceId" | "agentId">;
++
++/**
++ * One mounted editor's live draft. The composer registers it for as long as its editor is
++ * mounted; plugins read through the store so a stale registration can never outlive the pane.
++ */
++export interface ComposerDraftHandle {
++  read(): DraftSnapshot;
++  apply(edit: PluginComposerEdit): PluginComposerEditResult;
++}
++
++export function checkComposerEdit(
++  snapshot: DraftSnapshot,
++  edit: PluginComposerEdit,
++): PluginComposerEditFailure | null {
++  if (!snapshot.editable) return "read-only";
++  if (snapshot.ime !== "idle") return "ime";
++  if (edit.draftId !== snapshot.draftId) return "stale";
++  if (edit.revision !== snapshot.revision) return "stale";
++  const { start, end } = edit.range;
++  if (!Number.isInteger(start) || !Number.isInteger(end)) return "mismatch";
++  if (start < 0 || end < start || end > snapshot.text.length) return "mismatch";
++  if (snapshot.text.slice(start, end) !== edit.expectedText) return "mismatch";
++  return null;
++}
++
++export class ComposerBridgeStore {
++  private handles = new Map<string, ComposerDraftHandle[]>();
++  private listeners = new Map<string, Set<() => void>>();
++
++  register(serverId: string, workspaceId: string, agentId: string, handle: ComposerDraftHandle) {
++    const key = targetKey(serverId, workspaceId, agentId);
++    const current = this.handles.get(key);
++    if (current) current.push(handle);
++    else this.handles.set(key, [handle]);
++    this.emit(key);
++    let released = false;
++    return () => {
++      if (released) return;
++      released = true;
++      const remaining = (this.handles.get(key) ?? []).filter((entry) => entry !== handle);
++      if (remaining.length > 0) this.handles.set(key, remaining);
++      else this.handles.delete(key);
++      this.emit(key);
++    };
++  }
++
++  private active(key: string): ComposerDraftHandle | null {
++    const entries = this.handles.get(key);
++    return entries && entries.length > 0 ? entries[entries.length - 1]! : null;
++  }
++
++  read(serverId: string, target: PluginComposerTarget): PluginComposerSnapshot | null {
++    const handle = this.active(targetKey(serverId, target.workspaceId, target.agentId));
++    if (!handle) return null;
++    return { workspaceId: target.workspaceId, agentId: target.agentId, ...handle.read() };
++  }
++
++  subscribe(
++    serverId: string,
++    target: PluginComposerTarget,
++    listener: (snapshot: PluginComposerSnapshot | null) => void,
++  ): () => void {
++    const key = targetKey(serverId, target.workspaceId, target.agentId);
++    let listeners = this.listeners.get(key);
++    if (!listeners) {
++      listeners = new Set();
++      this.listeners.set(key, listeners);
++    }
++    const notify = () => listener(this.read(serverId, target));
++    listeners.add(notify);
++    notify();
++    return () => {
++      const current = this.listeners.get(key);
++      if (!current) return;
++      current.delete(notify);
++      if (current.size === 0) this.listeners.delete(key);
++    };
++  }
++
++  apply(
++    serverId: string,
++    target: PluginComposerTarget,
++    edit: PluginComposerEdit,
++  ): PluginComposerEditResult {
++    const handle = this.active(targetKey(serverId, target.workspaceId, target.agentId));
++    if (!handle) return { ok: false, reason: "unavailable" };
++    return handle.apply(edit);
++  }
++
++  /** A mounted composer calls this when its own draft changed. */
++  notify(serverId: string, workspaceId: string, agentId: string): void {
++    this.emit(targetKey(serverId, workspaceId, agentId));
++  }
++
++  private emit(key: string): void {
++    const listeners = this.listeners.get(key);
++    if (!listeners) return;
++    for (const listener of listeners) listener();
++  }
++}
++
++export const composerBridgeStore = new ComposerBridgeStore();
+diff --git a/packages/app/src/plugins/composer-status/store.test.ts b/packages/app/src/plugins/composer-status/store.test.ts
+new file mode 100644
+index 0000000..feee23c
+--- /dev/null
++++ b/packages/app/src/plugins/composer-status/store.test.ts
+@@ -0,0 +1,131 @@
++import { describe, expect, it } from "vitest";
++import type { InstalledPlugin } from "../types";
++import { PluginComposerStatusStore } from "./store";
++
++function installation(id = "review", serverId = "host-a"): InstalledPlugin {
++  return { id, serverId } as unknown as InstalledPlugin;
++}
++
++function component() {
++  return () => null;
++}
++
++describe("PluginComposerStatusStore", () => {
++  it("registers a row only for its own host, workspace, and agent", () => {
++    const store = new PluginComposerStatusStore();
++    const Component = component();
++    store.add(installation(), {
++      id: "insights",
++      workspaceId: "wks-1",
++      agentId: "agent-1",
++      Component,
++    });
++    const entries = store.getSnapshot();
++    expect(entries).toHaveLength(1);
++    expect(entries[0]).toMatchObject({ id: "insights", workspaceId: "wks-1", agentId: "agent-1" });
++  });
++
++  it("rejects duplicate ids for the same target and keeps other agents apart", () => {
++    const store = new PluginComposerStatusStore();
++    const source = installation();
++    store.add(source, {
++      id: "insights",
++      workspaceId: "wks-1",
++      agentId: "agent-1",
++      Component: component(),
++    });
++    expect(() =>
++      store.add(source, {
++        id: "insights",
++        workspaceId: "wks-1",
++        agentId: "agent-1",
++        Component: component(),
++      }),
++    ).toThrow(/Duplicate composer status/);
++    expect(() =>
++      store.add(source, {
++        id: "insights",
++        workspaceId: "wks-1",
++        agentId: "agent-2",
++        Component: component(),
++      }),
++    ).not.toThrow();
++  });
++
++  it("validates ids and components", () => {
++    const store = new PluginComposerStatusStore();
++    const source = installation();
++    expect(() =>
++      store.add(source, {
++        id: "Bad Id",
++        workspaceId: "wks-1",
++        agentId: "agent-1",
++        Component: component(),
++      }),
++    ).toThrow(/Invalid composer status id/);
++    expect(() =>
++      store.add(source, {
++        id: "insights",
++        workspaceId: "wks-1",
++        agentId: "agent-1",
++        Component: undefined as never,
++      }),
++    ).toThrow(/not a component/);
++  });
++
++  it("removes one registration without touching the others", () => {
++    const store = new PluginComposerStatusStore();
++    const source = installation();
++    const registration = store.add(source, {
++      id: "insights",
++      workspaceId: "wks-1",
++      agentId: "agent-1",
++      Component: component(),
++    });
++    store.add(source, {
++      id: "assistant",
++      workspaceId: "wks-1",
++      agentId: "agent-1",
++      Component: component(),
++    });
++    registration.remove();
++    registration.remove();
++    expect(store.getSnapshot().map((entry) => entry.id)).toEqual(["assistant"]);
++  });
++
++  it("updates the component in place and ignores updates after removal", () => {
++    const store = new PluginComposerStatusStore();
++    const source = installation();
++    const registration = store.add(source, {
++      id: "insights",
++      workspaceId: "wks-1",
++      agentId: "agent-1",
++      Component: component(),
++    });
++    const replacement = component();
++    registration.update({ Component: replacement });
++    expect(store.getSnapshot()[0]?.Component).toBe(replacement);
++    registration.remove();
++    registration.update({ Component: component() });
++    expect(store.getSnapshot()).toHaveLength(0);
++  });
++
++  it("drops every row from a disposed installation", () => {
++    const store = new PluginComposerStatusStore();
++    const source = installation();
++    store.add(installation("other"), {
++      id: "insights",
++      workspaceId: "wks-1",
++      agentId: "agent-1",
++      Component: component(),
++    });
++    store.add(source, {
++      id: "insights",
++      workspaceId: "wks-1",
++      agentId: "agent-1",
++      Component: component(),
++    });
++    store.removeInstallation(source);
++    expect(store.getSnapshot()).toHaveLength(1);
++  });
++});
+diff --git a/packages/app/src/plugins/composer-status/store.ts b/packages/app/src/plugins/composer-status/store.ts
+new file mode 100644
+index 0000000..e0410ca
+--- /dev/null
++++ b/packages/app/src/plugins/composer-status/store.ts
+@@ -0,0 +1,100 @@
++import type { ComponentType } from "react";
++import type {
++  PluginComposerStatusProps,
++  PluginComposerStatusRegistration,
++} from "@getpaseo/plugin/client";
++import type { InstalledPlugin } from "../types";
++
++const CONTRIBUTION_ID = /^[a-z][a-z0-9-]*$/;
++
++export interface RegisteredPluginComposerStatus {
++  key: number;
++  id: string;
++  installation: InstalledPlugin;
++  workspaceId: string;
++  agentId: string;
++  Component: ComponentType<PluginComposerStatusProps>;
++}
++
++export class PluginComposerStatusStore {
++  private entries: readonly RegisteredPluginComposerStatus[] = [];
++  private nextKey = 0;
++  private listeners = new Set<() => void>();
++
++  subscribe = (listener: () => void): (() => void) => {
++    this.listeners.add(listener);
++    return () => {
++      this.listeners.delete(listener);
++    };
++  };
++
++  getSnapshot = (): readonly RegisteredPluginComposerStatus[] => this.entries;
++
++  add(
++    installation: InstalledPlugin,
++    contribution: {
++      id: string;
++      workspaceId: string;
++      agentId: string;
++      Component: ComponentType<PluginComposerStatusProps>;
++    },
++  ): PluginComposerStatusRegistration {
++    const id = typeof contribution.id === "string" ? contribution.id.trim() : "";
++    if (!CONTRIBUTION_ID.test(id)) throw new Error(`Invalid composer status id: ${id}`);
++    const workspaceId = contribution.workspaceId?.trim() ?? "";
++    const agentId = contribution.agentId?.trim() ?? "";
++    if (!workspaceId) throw new Error("Plugin composer status needs a workspace");
++    if (!agentId) throw new Error("Plugin composer status needs an agent");
++    if (typeof contribution.Component !== "function") {
++      throw new Error(`Composer status ${id} is not a component`);
++    }
++    const duplicate = this.entries.some(
++      (entry) =>
++        entry.installation === installation &&
++        entry.id === id &&
++        entry.workspaceId === workspaceId &&
++        entry.agentId === agentId,
++    );
++    if (duplicate) throw new Error(`Duplicate composer status: ${id}`);
++    const key = this.nextKey++;
++    let active = true;
++    const publish = (Component: ComponentType<PluginComposerStatusProps>) => {
++      if (!active) return;
++      this.entries = [
++        ...this.entries.filter((entry) => entry.key !== key),
++        { key, id, installation, workspaceId, agentId, Component },
++      ];
++      for (const listener of this.listeners) listener();
++    };
++    publish(contribution.Component);
++    return {
++      update: (patch) => {
++        if (!active) return;
++        if (patch.Component !== undefined) {
++          if (typeof patch.Component !== "function") {
++            throw new Error(`Composer status ${id} is not a component`);
++          }
++          publish(patch.Component);
++        }
++      },
++      remove: () => {
++        if (!active) return;
++        active = false;
++        const next = this.entries.filter((entry) => entry.key !== key);
++        if (next.length === this.entries.length) return;
++        this.entries = next;
++        for (const listener of this.listeners) listener();
++      },
++    };
++  }
++
++  /** Drops every status a disposed installation registered. */
++  removeInstallation(installation: InstalledPlugin): void {
++    const next = this.entries.filter((entry) => entry.installation !== installation);
++    if (next.length === this.entries.length) return;
++    this.entries = next;
++    for (const listener of this.listeners) listener();
++  }
++}
++
++export const composerStatusStore = new PluginComposerStatusStore();
+diff --git a/packages/app/src/plugins/composer-status/view.tsx b/packages/app/src/plugins/composer-status/view.tsx
+new file mode 100644
+index 0000000..943e6e6
+--- /dev/null
++++ b/packages/app/src/plugins/composer-status/view.tsx
+@@ -0,0 +1,140 @@
++import { useMemo, useSyncExternalStore } from "react";
++import { View } from "react-native";
++import { StyleSheet, withUnistyles } from "react-native-unistyles";
++import type { PluginComposerStatusProps } from "@getpaseo/plugin/client";
++import { useIsCompactFormFactor } from "@/constants/layout";
++import { useToast } from "@/contexts/toast-context";
++import { useHostRuntimeClient, useHosts } from "@/runtime/host-runtime";
++import type { Theme } from "@/styles/theme";
++import { createPluginClientStateSource } from "../client-state/source";
++import { resolvePluginPlatform } from "../platform";
++import { PluginEnvironmentProvider } from "../popover";
++import { SurfaceErrorBoundary } from "../surface-error-boundary";
++import { toPluginTheme } from "../theme";
++import { composerStatusStore, type RegisteredPluginComposerStatus } from "./store";
++
++function useComposerStatuses(
++  serverId: string,
++  workspaceId: string,
++  agentId: string,
++): readonly RegisteredPluginComposerStatus[] {
++  const entries = useSyncExternalStore(
++    composerStatusStore.subscribe,
++    composerStatusStore.getSnapshot,
++    composerStatusStore.getSnapshot,
++  );
++  return useMemo(
++    () =>
++      entries.filter(
++        (entry) =>
++          entry.installation.serverId === serverId &&
++          entry.workspaceId === workspaceId &&
++          entry.agentId === agentId,
++      ),
++    [entries, serverId, workspaceId, agentId],
++  );
++}
++
++export function useHasPluginComposerStatus(
++  serverId: string,
++  workspaceId: string,
++  agentId: string,
++): boolean {
++  return useComposerStatuses(serverId, workspaceId, agentId).length > 0;
++}
++
++const pluginThemeMapping = (theme: Theme) => ({ theme: toPluginTheme(theme) });
++
++function renderNothing(): null {
++  return null;
++}
++
++function PluginComposerStatusHost({
++  entry,
++  theme,
++  compact,
++}: {
++  entry: RegisteredPluginComposerStatus;
++  theme: PluginComposerStatusProps["theme"];
++  compact: boolean;
++}) {
++  const client = useHostRuntimeClient(entry.installation.serverId);
++  const toast = useToast();
++  const hosts = useHosts();
++  const hostLabel = hosts.find((host) => host.serverId === entry.installation.serverId)?.label;
++  const environment = useMemo(
++    () => ({
++      installation: entry.installation,
++      toast,
++      state: createPluginClientStateSource(entry.installation.serverId),
++    }),
++    [entry.installation, toast],
++  );
++  if (!client) return null;
++  const Component = entry.Component;
++  const props: PluginComposerStatusProps = {
++    workspaceId: entry.workspaceId,
++    agentId: entry.agentId,
++    theme,
++    host: {
++      id: entry.installation.serverId,
++      label: hostLabel ?? entry.installation.serverId,
++    },
++    layout: { compact, platform: resolvePluginPlatform() },
++  };
++  return (
++    <SurfaceErrorBoundary
++      installation={entry.installation}
++      resetKey={entry.key}
++      Surface={Component}
++      renderError={renderNothing}
++    >
++      <PluginEnvironmentProvider environment={environment}>
++        <Component {...props} />
++      </PluginEnvironmentProvider>
++    </SurfaceErrorBoundary>
++  );
++}
++
++const ThemedStatusHost = withUnistyles(PluginComposerStatusHost);
++
++/**
++ * The row sits directly below the composer and only exists while a plugin contributes to this
++ * exact host, workspace, and agent. It collapses to nothing when the last contribution leaves.
++ */
++export function PluginComposerStatusRow({
++  serverId,
++  workspaceId,
++  agentId,
++}: {
++  serverId: string;
++  workspaceId: string;
++  agentId: string;
++}) {
++  const entries = useComposerStatuses(serverId, workspaceId, agentId);
++  const compact = useIsCompactFormFactor();
++  if (entries.length === 0) return null;
++  return (
++    <View style={styles.row} testID="plugin-composer-status">
++      {entries.map((entry) => (
++        <ThemedStatusHost
++          key={entry.key}
++          entry={entry}
++          compact={compact}
++          uniProps={pluginThemeMapping}
++        />
++      ))}
++    </View>
++  );
++}
++
++const styles = StyleSheet.create((theme) => ({
++  row: {
++    flexDirection: "row",
++    alignItems: "center",
++    flexWrap: "wrap",
++    gap: theme.spacing[2],
++    paddingHorizontal: theme.spacing[3],
++    paddingBottom: theme.spacing[1],
++  },
++}));
+diff --git a/packages/app/src/plugins/evaluate.ts b/packages/app/src/plugins/evaluate.ts
+index ea37209..85eb00d 100644
+--- a/packages/app/src/plugins/evaluate.ts
++++ b/packages/app/src/plugins/evaluate.ts
+@@ -113,6 +113,8 @@ export type PluginClientRuntime = Pick<
+   | "openPanel"
+   | "addComposerPill"
+   | "addHeaderButton"
++  | "addComposerStatus"
++  | "composer"
+ > & { hosts: ReturnType<typeof createPluginHosts> };
+ 
+ // COMPAT(pluginReactNativeEntrypoint): added in v0.13.0, remove after 2027-04-20
+@@ -505,6 +507,25 @@ export function runPluginClientBundle(
+       if (stopped) throw new Error("Plugin has stopped");
+       return trackButton(runtime.addHeaderButton(contribution));
+     },
++    addComposerStatus(contribution) {
++      if (stopped) throw new Error("Plugin has stopped");
++      if (!runtime.addComposerStatus) throw new Error("Composer status is unavailable");
++      const registration = runtime.addComposerStatus(contribution);
++      let active = true;
++      const remove = () => {
++        if (!active) return;
++        active = false;
++        registration.remove();
++        removals.delete(remove);
++      };
++      removals.add(remove);
++      return {
++        update: (patch) => {
++          if (active) registration.update(patch);
++        },
++        remove,
++      };
++    },
+   };
+   const runtimeRequire = (name: string): unknown => {
+     // COMPAT(pluginReactNativeEntrypoint): added in v0.13.0, remove after 2027-04-20
+diff --git a/packages/app/src/plugins/index.ts b/packages/app/src/plugins/index.ts
+index ac3500e..ff33e46 100644
+--- a/packages/app/src/plugins/index.ts
++++ b/packages/app/src/plugins/index.ts
+@@ -9,3 +9,4 @@ export {
+   useHasPluginComposerPills,
+   usePluginWorkspaceMenu,
+ } from "./buttons/view";
++export { PluginComposerStatusRow, useHasPluginComposerStatus } from "./composer-status/view";
+diff --git a/packages/plugin/src/client/composer.ts b/packages/plugin/src/client/composer.ts
+new file mode 100644
+index 0000000..c396b88
+--- /dev/null
++++ b/packages/plugin/src/client/composer.ts
+@@ -0,0 +1,78 @@
++import type { ComponentType } from "react";
++import type { PluginHostProps } from "./contracts.js";
++import type { PluginText } from "../text.js";
++
++/**
++ * Patched-host composer access. Official Paseo 0.15.x has no equivalent, so plugins must treat
++ * `client.composer` as optional and check `version` before offering draft editing.
++ */
++
++export type PluginComposerImeState = "idle" | "composing" | "unknown";
++
++export interface PluginComposerTarget {
++  workspaceId: string;
++  agentId: string;
++}
++
++export interface PluginComposerSnapshot {
++  workspaceId: string;
++  agentId: string;
++  /** Stable for one draft. Changes when the pane switches to another agent. */
++  draftId: string;
++  /** Increments whenever the text changes, including programmatic replacement. */
++  revision: number;
++  text: string;
++  selection: { start: number; end: number };
++  /** Web reports composition; native reports `unknown` and rejects writes. */
++  ime: PluginComposerImeState;
++  /** Number of attachments on the draft. Host never exposes their contents here. */
++  attachments: number;
++  /** False while the composer is read-only or a send is loading. */
++  editable: boolean;
++}
++
++export interface PluginComposerEdit {
++  draftId: string;
++  /** The revision the plugin read before generating the replacement. */
++  revision: number;
++  range: { start: number; end: number };
++  /** The text the plugin believes occupies `range`. A mismatch rejects the write. */
++  expectedText: string;
++  replacement: string;
++}
++
++export type PluginComposerEditFailure = "unavailable" | "stale" | "mismatch" | "ime" | "read-only";
++
++export type PluginComposerEditResult =
++  | { ok: true; revision: number; undoable: boolean }
++  | { ok: false; reason: PluginComposerEditFailure };
++
++export interface PluginComposerBridge {
++  readonly version: 1;
++  read(target: PluginComposerTarget): PluginComposerSnapshot | null;
++  subscribe(
++    target: PluginComposerTarget,
++    listener: (snapshot: PluginComposerSnapshot | null) => void,
++  ): () => void;
++  apply(target: PluginComposerTarget, edit: PluginComposerEdit): PluginComposerEditResult;
++}
++
++/** One compact row directly below the native composer. */
++export interface PluginComposerStatusProps extends PluginHostProps {
++  workspaceId: string;
++  agentId: string;
++}
++
++export interface PluginComposerStatusContribution<Text extends PluginText = string> {
++  id: string;
++  workspaceId: string;
++  agentId: string;
++  Component: ComponentType<PluginComposerStatusProps>;
++  /** Accessible name for the row when the component renders no text. */
++  label?: Text;
++}
++
++export interface PluginComposerStatusRegistration {
++  update(patch: { Component?: ComponentType<PluginComposerStatusProps> }): void;
++  remove(): void;
++}
+diff --git a/packages/plugin/src/client/contracts.ts b/packages/plugin/src/client/contracts.ts
+index 7675a65..e9738d6 100644
+--- a/packages/plugin/src/client/contracts.ts
++++ b/packages/plugin/src/client/contracts.ts
+@@ -10,6 +10,11 @@ import type {
+   PluginHeaderButtonContribution,
+   PluginComposerPillContribution,
+ } from "./buttons.js";
++import type {
++  PluginComposerBridge,
++  PluginComposerStatusContribution,
++  PluginComposerStatusRegistration,
++} from "./composer.js";
+ import type {
+   PluginTheme,
+   PluginWorkspaceSnapshot,
+@@ -193,6 +198,17 @@ export interface PluginClientContext extends PluginCommandCapabilities, PluginCl
+   addComposerPill(
+     contribution: PluginComposerPillContribution<PluginText>,
+   ): PluginButtonRegistration<PluginText>;
++  /**
++   * Patched hosts only. A compact row directly below the composer for this agent.
++   * Official 0.15.x returns undefined, so check before calling.
++   */
++  readonly addComposerStatus?: (
++    contribution: PluginComposerStatusContribution<PluginText>,
++  ) => PluginComposerStatusRegistration;
++  /**
++   * Patched hosts only. Native composer draft access. Official 0.15.x leaves this undefined.
++   */
++  readonly composer?: PluginComposerBridge;
+   addAttachmentSource(contribution: PluginAttachmentSourceContribution<PluginText>): PluginCleanup;
+   addTheme(contribution: PluginThemeContribution<PluginText>): PluginCleanup;
+   addFilePanel(contribution: PluginFilePanelContribution<PluginText>): PluginCleanup;
+diff --git a/packages/plugin/src/client/index.ts b/packages/plugin/src/client/index.ts
+index 62cf7e2..3c346b4 100644
+--- a/packages/plugin/src/client/index.ts
++++ b/packages/plugin/src/client/index.ts
+@@ -53,6 +53,18 @@ export type {
+   PluginComposerPillContribution,
+   PluginHeaderButtonContribution,
+ } from "./buttons.js";
++export type {
++  PluginComposerBridge,
++  PluginComposerEdit,
++  PluginComposerEditFailure,
++  PluginComposerEditResult,
++  PluginComposerImeState,
++  PluginComposerSnapshot,
++  PluginComposerStatusContribution,
++  PluginComposerStatusProps,
++  PluginComposerStatusRegistration,
++  PluginComposerTarget,
++} from "./composer.js";
+ export type { PluginIconProps, PluginSerializableIcon, PluginSvgIcon } from "../icons.js";
+ export type {
+   PluginFile,

@@ -1,0 +1,6 @@
+{
+  "id": "composer-assistant",
+  "name": "Composer Assistant",
+  "description": "Preview an improved draft before replacing the composer text; the user always sends the message.",
+  "requirements": { "paseo": ">=0.15.0 <0.16.0" }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "paseo-composer-assistant",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "files": [
+    "paseo-plugin.json",
+    "README.md",
+    "INSTALL.md",
+    "PRIVACY.md",
+    "LICENSE",
+    "index.client.tsx",
+    "index.server.ts",
+    "client/",
+    "server/",
+    "shared/",
+    "host-bridge/",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test shared/*.test.ts server/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.15.0",
+    "@types/node": "^22.19.0",
+    "@types/react": "~19.2.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "typescript": "^5.9.3",
+    "zod": "^4.4.3"
+  }
+}
